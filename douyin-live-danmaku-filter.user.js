@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播飘屏弹幕关键词屏蔽
 // @namespace    https://github.com/Evil-artc/Tampermonkey-script
-// @version      1.4.1
+// @version      1.5.0
 // @description  网页端抖音直播间屏蔽视频上飘屏弹幕里包含指定关键词的消息。基于真实通信结构编写：飘屏弹幕由主线程通过 Worker.postMessage({method:"addBarrage", params:{content:[{type:"text",text:"..."}]}}) 发给渲染 Worker，脚本在发送前按关键词拦截，命中则不转发，弹幕永不渲染。另含“一键全关弹幕层”兜底。
 // @author       只剩寒暄
 // @match        https://live.douyin.com/*
