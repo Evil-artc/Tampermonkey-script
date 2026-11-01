@@ -20,17 +20,40 @@
   // （旧版用 @grant GM_* 会被 Tampermonkey 关进沙箱 isolated world，
   //   window.Worker 的替换只改到沙箱里，页面看不到，导致关键词失效。）
 
-  const KW_KEY  = 'douyin_danmaku_block_keywords';
-  const OPT_KEY = 'douyin_danmaku_block_opts';
-  const ON_KEY  = 'douyin_danmaku_block_enabled';
-  const ALL_KEY = 'douyin_danmaku_block_all';
+  const KW_KEY      = 'douyin_danmaku_block_keywords';        // 全局关键词（所有直播间）
+  const ROOM_KW_KEY = 'douyin_danmaku_block_room_keywords';    // {"roomId":["kw",...]}
+  const OPT_KEY     = 'douyin_danmaku_block_opts';
+  const ON_KEY      = 'douyin_danmaku_block_enabled';
+  const ALL_KEY     = 'douyin_danmaku_block_all';
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
   };
 
-  let keywords = (store.get(KW_KEY, '') || '').split('\n').map(s => s.trim()).filter(Boolean);
+  function parseList(s) {
+    return (s || '').split('\n').map(x => x.trim()).filter(Boolean);
+  }
+  function safeParse(s, d) {
+    try { const o = JSON.parse(s); return (o && typeof o === 'object') ? o : d; } catch (e) { return d; }
+  }
+
+  // 当前直播间标识：取 URL 里的房间号；取不到则退化为 host+path
+  function getRoomId() {
+    try {
+      const m = location.href.match(/live\.douyin\.com\/(\d+)/)
+            || location.href.match(/follow\/live\/(\d+)/)
+            || location.href.match(/douyin\.com\/live\/(\d+)/);
+      if (m) return m[1];
+    } catch (e) {}
+    return location.host + location.pathname;
+  }
+  const roomId = getRoomId();
+
+  let globalKeywords = parseList(store.get(KW_KEY, ''));
+  let roomMap = safeParse(store.get(ROOM_KW_KEY, '{}'), {});
+  let roomKeywords = Array.isArray(roomMap[roomId]) ? roomMap[roomId].slice() : [];
+
   let enabled  = store.get(ON_KEY, '1') !== '0';
   let blockAll = store.get(ALL_KEY, '0') === '1';
   let opts = Object.assign({ caseSensitive: false, regex: false }, JSON.parse(store.get(OPT_KEY, '{}') || '{}'));
@@ -38,10 +61,11 @@
   let blockedCount = 0;
   const updateBadgeCbs = [];
 
-  function isBlocked(text) {
-    if (!text) return false;
+  // 对单个关键词列表做匹配
+  function matchList(text, list) {
+    if (!list || !list.length) return false;
     const t = opts.caseSensitive ? text : text.toLowerCase();
-    for (const raw of keywords) {
+    for (const raw of list) {
       if (!raw) continue;
       if (opts.regex) {
         try { if (new RegExp(raw, opts.caseSensitive ? '' : 'i').test(text)) return true; } catch (e) {}
@@ -51,6 +75,12 @@
       }
     }
     return false;
+  }
+
+  function isBlocked(text) {
+    if (!text) return false;
+    // 全局命中 或 当前直播间命中，任一即屏蔽
+    return matchList(text, globalKeywords) || matchList(text, roomKeywords);
   }
 
   // 从 addBarrage 消息里提取完整弹幕文本（昵称+内容都在 content 里）
@@ -117,7 +147,7 @@
     if (layer) layer.style.display = blockAll ? 'none' : '';
   }
 
-  // ============ 单一面板 UI ============
+  // ============ 单一面板 UI（全局 + 当前直播间两套关键词）============
   function buildUI() {
     const style = document.createElement('style');
     style.textContent = `
@@ -137,7 +167,12 @@
       #dd-panel .dd-bd{padding:10px 12px;display:none;border-top:1px solid #3a3f47;}
       #dd-panel.open .dd-bd{display:block;}
       #dd-panel.off .dd-hd{opacity:.7;}
-      #dd-panel textarea{width:100%;height:110px;resize:vertical;background:#11141a;color:#e8eaed;
+      #dd-panel .dd-room{font-size:11px;color:#9aa0a6;margin-bottom:6px;word-break:break-all;}
+      #dd-panel .dd-lbl{display:block;font-size:12px;color:#9aa0a6;margin:8px 0 4px;}
+      #dd-panel .dd-lbl .dd-clr{float:right;color:#2f6bff;cursor:pointer;}
+      #dd-panel .dd-clr{cursor:pointer;color:#2f6bff;font-size:12px;}
+      #dd-panel .dd-clr:hover{text-decoration:underline;}
+      #dd-panel textarea{width:100%;height:84px;resize:vertical;background:#11141a;color:#e8eaed;
         border:1px solid #3a3f47;border-radius:8px;padding:8px;font-size:12px;line-height:1.5;}
       #dd-panel textarea:focus{outline:none;border-color:#2f6bff;}
       #dd-panel .dd-row{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap;}
@@ -145,8 +180,6 @@
       #dd-panel button{background:#2f6bff;color:#fff;border:0;border-radius:8px;padding:6px 14px;
         cursor:pointer;font-size:12px;transition:background .15s;}
       #dd-panel button:hover{background:#1f5af0;}
-      #dd-panel button.sec{background:#3a3f47;}
-      #dd-panel button.sec:hover{background:#474d56;}
       #dd-panel .dd-stat{margin-top:9px;color:#9aa0a6;font-size:12px;line-height:1.6;}
     `;
     document.head.appendChild(style);
@@ -161,7 +194,11 @@
         <span class="dd-toggle">▾</span>
       </div>
       <div class="dd-bd">
-        <textarea id="dd-kw" placeholder="每行一个关键词，支持通配请用正则模式&#10;例：&#10;广告&#10;加微信&#10;引流"></textarea>
+        <div class="dd-room">当前直播间：<span id="dd-room">--</span></div>
+        <label class="dd-lbl">全局关键词（所有直播间）</label>
+        <textarea id="dd-kw-global" placeholder="对所有直播间生效，每行一个关键词&#10;例：广告 / 加微信 / 引流"></textarea>
+        <label class="dd-lbl">本直播间关键词 <span class="dd-clr" id="dd-clr-room">清空</span></label>
+        <textarea id="dd-kw-room" placeholder="仅对当前直播间生效，每行一个"></textarea>
         <div class="dd-row">
           <label><input type="checkbox" id="dd-on"> 启用关键词</label>
           <label><input type="checkbox" id="dd-re"> 正则</label>
@@ -172,13 +209,15 @@
         </div>
         <div class="dd-row">
           <button id="dd-save">保存</button>
-          <button id="dd-reset" class="sec">清空</button>
+          <span class="dd-clr" id="dd-clr-global">清空全局</span>
         </div>
         <div class="dd-stat" id="dd-stat"></div>
       </div>`;
     document.body.appendChild(panel);
 
-    const ta = panel.querySelector('#dd-kw');
+    const taG = panel.querySelector('#dd-kw-global');
+    const taR = panel.querySelector('#dd-kw-room');
+    const elRoom = panel.querySelector('#dd-room');
     const elOn = panel.querySelector('#dd-on');
     const elRe = panel.querySelector('#dd-re');
     const elCi = panel.querySelector('#dd-ci');
@@ -186,46 +225,60 @@
     const badge = panel.querySelector('#dd-badge');
     const stat = panel.querySelector('#dd-stat');
 
+    function updateBadge() {
+      const active = enabled || blockAll;
+      panel.classList.toggle('off', !active);
+      badge.textContent = active ? ('已拦 ' + blockedCount) : '已关';
+      stat.innerHTML = `状态：${enabled ? '关键词过滤中' : '已关闭'} ｜ 全关：${blockAll ? '开' : '关'}<br>全局：${globalKeywords.length} 个 ｜ 本间：${roomKeywords.length} 个 ｜ 已屏蔽：${blockedCount} 条`;
+    }
+    updateBadgeCbs.push(updateBadge);
+
     function syncInputs() {
-      ta.value = keywords.join('\n');
+      elRoom.textContent = roomId;
+      taG.value = globalKeywords.join('\n');
+      taR.value = roomKeywords.join('\n');
       elOn.checked = enabled;
       elRe.checked = opts.regex;
       elCi.checked = opts.caseSensitive;
       elAll.checked = blockAll;
       updateBadge();
     }
-    function updateBadge() {
-      const active = enabled || blockAll;
-      panel.classList.toggle('off', !active);
-      badge.textContent = active ? ('已拦 ' + blockedCount) : '已关';
-      stat.innerHTML = `状态：${enabled ? '关键词过滤中' : '已关闭'} ｜ 全关：${blockAll ? '开' : '关'}<br>关键词：${keywords.length} 个 ｜ 已屏蔽弹幕：${blockedCount} 条`;
-    }
-    updateBadgeCbs.push(updateBadge);
 
-    // 标题栏：展开/收起 + 拖拽
     panel.querySelector('.dd-hd').addEventListener('click', (e) => {
       if (e.target.closest('button')) return;
       panel.classList.toggle('open');
     });
 
     panel.querySelector('#dd-save').addEventListener('click', () => {
-      keywords = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+      globalKeywords = parseList(taG.value);
+      roomKeywords = parseList(taR.value);
       enabled = elOn.checked;
       opts.regex = elRe.checked;
       opts.caseSensitive = elCi.checked;
       blockAll = elAll.checked;
-      store.set(KW_KEY, keywords.join('\n'));
-      store.set(ON_KEY, enabled ? '1' : '0');
+      if (roomKeywords.length) roomMap[roomId] = roomKeywords.slice();
+      else delete roomMap[roomId];
+      store.set(KW_KEY, globalKeywords.join('\n'));
+      store.set(ROOM_KW_KEY, JSON.stringify(roomMap));
       store.set(OPT_KEY, JSON.stringify(opts));
+      store.set(ON_KEY, enabled ? '1' : '0');
       store.set(ALL_KEY, blockAll ? '1' : '0');
       applyBlockAll();
       updateBadge();
     });
 
-    panel.querySelector('#dd-reset').addEventListener('click', () => {
-      ta.value = '';
-      keywords = [];
+    panel.querySelector('#dd-clr-global').addEventListener('click', () => {
+      globalKeywords = [];
+      taG.value = '';
       store.set(KW_KEY, '');
+      updateBadge();
+    });
+
+    panel.querySelector('#dd-clr-room').addEventListener('click', () => {
+      roomKeywords = [];
+      taR.value = '';
+      delete roomMap[roomId];
+      store.set(ROOM_KW_KEY, JSON.stringify(roomMap));
       updateBadge();
     });
 
