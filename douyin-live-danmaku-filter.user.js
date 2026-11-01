@@ -1,4 +1,4 @@
-Tampermonkey script// ==UserScript==
+// ==UserScript==
 // @name         抖音直播飘屏弹幕关键词屏蔽
 // @namespace    https://github.com/Evil-artc/Tampermonkey-script
 // @version      1.4.0
