@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         抖音直播飘屏弹幕关键词屏蔽
 // @namespace    https://github.com/
-// @version      1.6.0
-// @description  网页端抖音直播间屏蔽视频上飘屏弹幕里包含指定关键词的消息。支持“全局关键词(所有直播间)”与“当前直播间关键词(仅本房间)”两套规则。基于真实通信结构：飘屏弹幕由主线程通过 Worker.postMessage({method:"addBarrage", params:{content:[{type:"text",text:"..."}]}}) 发给渲染 Worker，脚本在发送前按关键词拦截，命中则不转发，弹幕永不渲染。v1.6 修复：登录态 www.douyin.com/follow/live/* 下 UI 不显示/不生效的问题（跨子域共享关键词、跨帧同步、UI 被 SPA 清掉自动重建）；另含“一键全关弹幕层”兜底。
+// @version      1.9.2
+// @description  网页端抖音直播间屏蔽视频上飘屏弹幕里包含指定关键词的消息。支持"全局关键词(所有直播间)"与"当前直播间关键词(仅本房间)"两套规则。基于真实通信结构：飘屏弹幕由主线程通过 Worker.postMessage({method:"addBarrage", params:{content:[{type:"text",text:"..."}]}}) 发给渲染 Worker，脚本在发送前按关键词拦截，命中则不转发，弹幕永不渲染。v1.9.2：退出直播间(URL 不再是 live/follow/live 且无 #DanmakuLayout)自动收起面板、回到直播间自动重建、SPA 路由切换即时响应；已移除全部调试代码。
 // @author       只剩寒暄
 // @match        https://live.douyin.com/*
 // @match        https://www.douyin.com/follow/live/*
 // @match        https://www.douyin.com/live/*
+// @match        https://*.douyin.com/*
+// @match        blob:*
 // @run-at       document-start
 // @grant        none
 // @license      MIT
@@ -15,28 +17,26 @@
 (function () {
   'use strict';
 
-  // @grant none => 本脚本运行在页面真实世界(main world)，
-  // 下面修改的 Worker.prototype.postMessage 对页面代码真实生效。
+  // 兼容：若脚本被注入到 Worker(无 document) 或非常规环境，直接退出，避免报错
+  if (typeof window === 'undefined' || typeof document === 'undefined' || !document.getElementById) return;
+
+  // @grant none => 本脚本运行在页面真实世界(main world)，下面改的 Worker.prototype.postMessage 对页面代码真实生效。
 
   const KW_KEY      = 'douyin_danmaku_block_keywords';
   const ROOM_KW_KEY = 'douyin_danmaku_block_room_keywords';
   const OPT_KEY     = 'douyin_danmaku_block_opts';
   const ON_KEY      = 'douyin_danmaku_block_enabled';
   const ALL_KEY     = 'douyin_danmaku_block_all';
+  const CLAIM_KEY   = 'dd_ui_claim';
 
-  // ============ 存储：cookie(.douyin.com 跨子域共享) + localStorage 兜底 ============
-  // 关键修复：www.douyin.com 与 live.douyin.com 是不同源，localStorage 不互通。
-  // 改用 .douyin.com 域 Cookie 让两组关键词在两个子域上共享同一份配置。
   function cookieGet(k) {
     try {
       const m = document.cookie.match(new RegExp('(?:^|; )' + k + '=([^;]*)'));
       return m ? decodeURIComponent(m[1]) : null;
     } catch (e) { return null; }
   }
-  function cookieSet(k, v) {
-    try {
-      document.cookie = k + '=' + encodeURIComponent(v) + '; domain=.douyin.com; path=/; max-age=31536000';
-    } catch (e) {}
+  function cookieSet(k, v, maxAge) {
+    try { document.cookie = k + '=' + encodeURIComponent(v) + '; domain=.douyin.com; path=/; max-age=' + (maxAge || 31536000); } catch (e) {}
   }
   const store = {
     get(k, d) {
@@ -45,20 +45,12 @@
       try { const l = localStorage.getItem(k); if (l != null) return l; } catch (e) {}
       return d;
     },
-    set(k, v) {
-      cookieSet(k, v);
-      try { localStorage.setItem(k, v); } catch (e) {}
-    },
+    set(k, v) { cookieSet(k, v); try { localStorage.setItem(k, v); } catch (e) {} },
   };
 
-  function parseList(s) {
-    return (s || '').split('\n').map(x => x.trim()).filter(Boolean);
-  }
-  function safeParse(s, d) {
-    try { const o = JSON.parse(s); return (o && typeof o === 'object') ? o : d; } catch (e) { return d; }
-  }
+  function parseList(s) { return (s || '').split('\n').map(x => x.trim()).filter(Boolean); }
+  function safeParse(s, d) { try { const o = JSON.parse(s); return (o && typeof o === 'object') ? o : d; } catch (e) { return d; } }
 
-  // 当前直播间标识：取 URL 里的房间号；取不到则退化为 host+path
   function getRoomId() {
     try {
       const m = location.href.match(/live\.douyin\.com\/(\d+)/)
@@ -70,7 +62,6 @@
   }
   const roomId = getRoomId();
 
-  // 这些变量为“内存态”，所有帧都独立持有；通过 cookie 初始化、通过 postMessage 跨帧同步
   let globalKeywords = parseList(store.get(KW_KEY, ''));
   let roomMap = safeParse(store.get(ROOM_KW_KEY, '{}'), {});
   let roomKeywords = Array.isArray(roomMap[roomId]) ? roomMap[roomId].slice() : [];
@@ -81,9 +72,7 @@
   let blockedCount = 0;
   const updateBadgeCbs = [];
 
-  // ============ 跨帧配置同步 ============
-  // 登录态 www.douyin.com/follow/live 往往把播放器嵌在 live.douyin.com 的 iframe 里，
-  // 弹幕 Worker 在子帧运行。父帧(UI)改词后，必须把最新配置推给子帧，否则子帧用旧内存态。
+  // ============ 跨帧配置同步（仅广播配置，不再协调“谁建 UI”）============
   function broadcastConfig() {
     const payload = { __dd_cfg: 1, roomId, globalKeywords, roomMap, opts, enabled, blockAll };
     try {
@@ -91,15 +80,12 @@
         try { window.frames[i].postMessage(payload, '*'); } catch (e) {}
       }
     } catch (e) {}
+    try { window.top.postMessage(payload, '*'); } catch (e) {}
   }
   window.addEventListener('message', (e) => {
     const d = e.data;
     if (!d) return;
-    if (d.__dd_req) {                 // 子帧请求配置
-      if (window === window.top) broadcastConfig();
-      return;
-    }
-    if (d.__dd_cfg) {                 // 收到父帧推送的配置
+    if (d.__dd_cfg) {
       globalKeywords = Array.isArray(d.globalKeywords) ? d.globalKeywords : globalKeywords;
       roomMap = (d.roomMap && typeof d.roomMap === 'object') ? d.roomMap : roomMap;
       opts = Object.assign({}, opts, d.opts || {});
@@ -107,12 +93,9 @@
       if (typeof d.blockAll === 'boolean') blockAll = d.blockAll;
       roomKeywords = Array.isArray(roomMap[roomId]) ? roomMap[roomId].slice() : [];
       applyBlockAll();
+      updateBadgeCbs.forEach(cb => cb());
     }
   });
-  // 子帧加载后主动问父帧要一次配置
-  if (window !== window.top) {
-    try { window.top.postMessage({ __dd_req: 1 }, '*'); } catch (e) {}
-  }
 
   // ============ 匹配逻辑 ============
   function matchList(text, list) {
@@ -133,7 +116,6 @@
     if (!text) return false;
     return matchList(text, globalKeywords) || matchList(text, roomKeywords);
   }
-
   function barrageText(msg) {
     try {
       const p = msg && msg.params;
@@ -154,11 +136,7 @@
       Worker.prototype.postMessage = function (msg, transfer) {
         if (enabled && msg && typeof msg === 'object' && msg.method === 'addBarrage') {
           const txt = barrageText(msg);
-          if (txt && isBlocked(txt)) {
-            blockedCount++;
-            updateBadgeCbs.forEach(cb => cb());
-            return;
-          }
+          if (txt && isBlocked(txt)) { blockedCount++; updateBadgeCbs.forEach(cb => cb()); return; }
         }
         return origPost.apply(this, arguments);
       };
@@ -171,11 +149,7 @@
         w.postMessage = function (msg, transfer) {
           if (enabled && msg && typeof msg === 'object' && msg.method === 'addBarrage') {
             const txt = barrageText(msg);
-            if (txt && isBlocked(txt)) {
-              blockedCount++;
-              updateBadgeCbs.forEach(cb => cb());
-              return;
-            }
+            if (txt && isBlocked(txt)) { blockedCount++; updateBadgeCbs.forEach(cb => cb()); return; }
           }
           return op(msg, transfer);
         };
@@ -187,16 +161,59 @@
   }
   installWorkerHook();
 
-  // ============ 兜底：一键全关弹幕层 ============
   function applyBlockAll() {
     const layer = document.getElementById('DanmakuLayout');
     if (layer) layer.style.display = blockAll ? 'none' : '';
   }
 
-  // ============ 单一面板 UI（只在最外层帧构建，避免 iframe 里重复/不可见）============
-  function buildUI() {
-    if (document.getElementById('dd-panel')) return;
+  // ============ UI 挂载：先到先得 + 播放器帧优先 ============
+  const myId = Math.random().toString(36).slice(2);
+  let uiHosted = false;
+  let claimedByOther = null;
+  let panelNode = null;
 
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    if (!d || !d.__dd_claim) return;
+    claimedByOther = d.id;
+    if (uiHosted && d.id !== myId) {
+      const p = document.getElementById('dd-panel');
+      if (p) { p.remove(); uiHosted = false; panelNode = null; }
+    }
+  });
+  function announceClaim() {
+    uiHosted = true;
+    store.set(CLAIM_KEY, myId + ':' + Date.now());
+    try {
+      for (let i = 0; i < window.frames.length; i++) { try { window.frames[i].postMessage({ __dd_claim: { id: myId } }, '*'); } catch (e) {} }
+    } catch (e) {}
+    try { if (window !== window.top) window.parent.postMessage({ __dd_claim: { id: myId } }, '*'); } catch (e) {}
+  }
+
+  function playerFrameElsewhere() {
+    try {
+      for (const f of window.frames) { try { if (f.document.getElementById('DanmakuLayout')) return true; } catch (e) {} }
+    } catch (e) {}
+    return false;
+  }
+
+  function isLiveContext() {
+    return /live\.douyin\.com|follow\/live|\/live\//.test(location.href) || !!document.getElementById('DanmakuLayout');
+  }
+
+  function tryHost() {
+    if (uiHosted && document.getElementById('dd-panel')) return;
+    if (!document.body) return;
+    if (document.getElementById('dd-panel')) { uiHosted = true; return; }
+    if (claimedByOther && claimedByOther !== myId) return; // 别人已认领
+    if (!isLiveContext()) return;                          // 仅直播间页面才建面板
+    const isPlayer = !!document.getElementById('DanmakuLayout');
+    if (isPlayer) { buildUI(); announceClaim(); return; }
+    if (window === window.top && !playerFrameElsewhere()) { buildUI(); announceClaim(); }
+  }
+
+  function buildUI() {
+    if (document.getElementById('dd-panel')) { panelNode = document.getElementById('dd-panel'); return; }
     let style = document.getElementById('dd-style');
     if (!style) {
       style = document.createElement('style');
@@ -207,8 +224,7 @@
           border:1px solid #3a3f47;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.45);
           font-size:13px;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden;}
         #dd-panel *{box-sizing:border-box;}
-        #dd-panel .dd-hd{display:flex;align-items:center;gap:8px;padding:9px 12px;background:#272b30;
-          cursor:move;user-select:none;}
+        #dd-panel .dd-hd{display:flex;align-items:center;gap:8px;padding:9px 12px;background:#272b30;cursor:move;user-select:none;}
         #dd-panel .dd-ic{font-size:15px;}
         #dd-panel .dd-hd b{font-size:14px;font-weight:600;flex:1;}
         #dd-panel .dd-badge{font-size:11px;color:#9aa0a6;background:#1c1f23;border:1px solid #3a3f47;
@@ -265,6 +281,7 @@
         <div class="dd-stat" id="dd-stat"></div>
       </div>`;
     (document.body || document.documentElement).appendChild(panel);
+    panelNode = panel;
 
     const taG = panel.querySelector('#dd-kw-global');
     const taR = panel.querySelector('#dd-kw-room');
@@ -299,7 +316,6 @@
       if (e.target.closest('button')) return;
       panel.classList.toggle('open');
     });
-
     panel.querySelector('#dd-save').addEventListener('click', () => {
       globalKeywords = parseList(taG.value);
       roomKeywords = parseList(taR.value);
@@ -316,22 +332,13 @@
       store.set(ALL_KEY, blockAll ? '1' : '0');
       applyBlockAll();
       updateBadge();
-      broadcastConfig(); // 把最新配置推给弹幕 Worker 所在的子帧
+      broadcastConfig();
     });
-
     panel.querySelector('#dd-clr-global').addEventListener('click', () => {
-      globalKeywords = [];
-      taG.value = '';
-      store.set(KW_KEY, '');
-      updateBadge();
+      globalKeywords = []; taG.value = ''; store.set(KW_KEY, ''); updateBadge();
     });
-
     panel.querySelector('#dd-clr-room').addEventListener('click', () => {
-      roomKeywords = [];
-      taR.value = '';
-      delete roomMap[roomId];
-      store.set(ROOM_KW_KEY, JSON.stringify(roomMap));
-      updateBadge();
+      roomKeywords = []; taR.value = ''; delete roomMap[roomId]; store.set(ROOM_KW_KEY, JSON.stringify(roomMap)); updateBadge();
     });
 
     let drag = null;
@@ -350,19 +357,48 @@
     syncInputs();
   }
 
-  // ============ 启动 ============
-  // UI 只建在最外层帧；被 SPA 重渲染清掉时，看门狗自动重建
-  function ensureUI() {
-    if (window !== window.top) return;          // 子帧不建 UI，只挂 Worker 钩子 + 监听配置
-    if (document.getElementById('dd-panel')) return;
-    if (!document.body) return;                 // body 还没好，下次看门狗再来
-    buildUI();
+  // 立即尝试 + 监听弹幕层出现 + 看门狗
+  tryHost();
+  document.addEventListener('DOMContentLoaded', tryHost);
+  setInterval(tryHost, 1500);
+  if (window === window.top) setTimeout(tryHost, 2500);
+  try {
+    const mo = new MutationObserver(() => { tryHost(); });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+  // 上下文守卫：退出直播间(URL 不是 live/follow/live 且无 #DanmakuLayout)时收起面板；
+  // 回到直播间时自动重建。抖音是大 SPA，切出直播间是客户端路由切换、不会整页刷新，
+  // 故需主动监听路由并周期检查，否则面板会一直挂在非直播页上。
+  function enforceContext() {
+    try {
+      const active = isLiveContext();
+      const panel = document.getElementById('dd-panel');
+      if (!active) {
+        if (panel) panel.remove();
+        panelNode = null;
+        uiHosted = false;
+        claimedByOther = null;
+      } else if (!panel) {
+        tryHost();
+        if (blockAll) applyBlockAll();
+      }
+    } catch (e) {}
   }
-  ensureUI();
-  document.addEventListener('DOMContentLoaded', ensureUI);
-  setInterval(ensureUI, 1500);                  // 看门狗：UI 被清掉就重建
-  setInterval(() => { if (blockAll) applyBlockAll(); }, 2000);
-
-  // 父帧加载完也广播一次，确保已存在的子帧拿到最新配置
+  // 面板防冲掉：若已建但被页面重绘移除，自动重新挂回同一节点(监听器保留)
+  setInterval(() => {
+    if (uiHosted && panelNode && !document.getElementById('dd-panel')) {
+      try { (document.body || document.documentElement).appendChild(panelNode); } catch (e) {}
+    }
+    if (blockAll) applyBlockAll();
+    enforceContext();
+  }, 1500);
+  // 监听 SPA 路由变化，及时收起/重建面板
+  try {
+    const _ps = history.pushState, _rs = history.replaceState;
+    history.pushState = function () { const r = _ps.apply(this, arguments); try { setTimeout(enforceContext, 0); } catch (e) {} return r; };
+    history.replaceState = function () { const r = _rs.apply(this, arguments); try { setTimeout(enforceContext, 0); } catch (e) {} return r; };
+    window.addEventListener('popstate', enforceContext);
+    window.addEventListener('hashchange', enforceContext);
+  } catch (e) {}
   if (window === window.top) setTimeout(broadcastConfig, 1500);
 })();
