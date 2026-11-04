@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音直播飘屏弹幕关键词屏蔽
 // @namespace    https://github.com/
-// @version      1.9.2
-// @description  网页端抖音直播间屏蔽视频上飘屏弹幕里包含指定关键词的消息。支持"全局关键词(所有直播间)"与"当前直播间关键词(仅本房间)"两套规则。基于真实通信结构：飘屏弹幕由主线程通过 Worker.postMessage({method:"addBarrage", params:{content:[{type:"text",text:"..."}]}}) 发给渲染 Worker，脚本在发送前按关键词拦截，命中则不转发，弹幕永不渲染。v1.9.2：退出直播间(URL 不再是 live/follow/live 且无 #DanmakuLayout)自动收起面板、回到直播间自动重建、SPA 路由切换即时响应；已移除全部调试代码。
+// @version      1.9.3
+// @description  网页端抖音直播间屏蔽视频上飘屏弹幕里包含指定关键词的消息。支持"全局关键词(所有直播间)"与"当前直播间关键词(仅本房间)"两套规则。基于真实通信结构：飘屏弹幕由主线程通过 Worker.postMessage({method:"addBarrage", params:{content:[{type:"text",text:"..."}]}}) 发给渲染 Worker，脚本在发送前按关键词拦截，命中则不转发，弹幕永不渲染。v1.9.3：修复 www.douyin.com/follow/live/* 下房间 id 解析为"www.douyin.com/"(SPA 启动占位)的问题——改为动态获取房间 id(建面板前与每轮上下文守卫/SPA 路由切换时刷新)，并补充 room_id 参数与 pathname 段兜底。
 // @author       只剩寒暄
 // @match        https://live.douyin.com/*
 // @match        https://www.douyin.com/follow/live/*
@@ -53,14 +53,23 @@
 
   function getRoomId() {
     try {
-      const m = location.href.match(/live\.douyin\.com\/(\d+)/)
-            || location.href.match(/follow\/live\/(\d+)/)
-            || location.href.match(/douyin\.com\/live\/(\d+)/);
+      const href = location.href;
+      const m = href.match(/live\.douyin\.com\/(\d+)/)
+            || href.match(/follow\/live\/(\d+)/)
+            || href.match(/douyin\.com\/live\/(\d+)/);
       if (m) return m[1];
+      const q = href.match(/[?&]room_id=(\d+)/);
+      if (q) return q[1];
+      // www.douyin.com/follow/live/<id> 兜底：从 pathname 段直接取
+      const seg = location.pathname.split('/').filter(Boolean);
+      const i = seg.indexOf('live');
+      if (i >= 0 && seg[i - 1] === 'follow' && seg[i + 1]) return seg[i + 1];
     } catch (e) {}
     return location.host + location.pathname;
   }
-  const roomId = getRoomId();
+  // id 动态获取：抖音是大 SPA，脚本启动那一刻 URL 可能仍是 www.douyin.com/，
+  // 正则匹配不到会掉进兜底返回 host+path；故后续在 tryHost / enforceContext 中持续刷新。
+  let roomId = getRoomId();
 
   let globalKeywords = parseList(store.get(KW_KEY, ''));
   let roomMap = safeParse(store.get(ROOM_KW_KEY, '{}'), {});
@@ -207,6 +216,12 @@
     if (document.getElementById('dd-panel')) { uiHosted = true; return; }
     if (claimedByOther && claimedByOther !== myId) return; // 别人已认领
     if (!isLiveContext()) return;                          // 仅直播间页面才建面板
+    // SPA 下 URL/roomId 可能晚于脚本启动才确定，建面板前刷新一次，避免 id 仍是 host+path 兜底值
+    const newId = getRoomId();
+    if (newId !== roomId) {
+      roomId = newId;
+      roomKeywords = Array.isArray(roomMap[roomId]) ? roomMap[roomId].slice() : [];
+    }
     const isPlayer = !!document.getElementById('DanmakuLayout');
     if (isPlayer) { buildUI(); announceClaim(); return; }
     if (window === window.top && !playerFrameElsewhere()) { buildUI(); announceClaim(); }
@@ -371,6 +386,17 @@
   // 故需主动监听路由并周期检查，否则面板会一直挂在非直播页上。
   function enforceContext() {
     try {
+      // 持续刷新房间 id：SPA 路由变化后 URL 才确定，需重新解析并同步面板
+      const newId = getRoomId();
+      if (newId !== roomId) {
+        roomId = newId;
+        roomKeywords = Array.isArray(roomMap[roomId]) ? roomMap[roomId].slice() : [];
+        const elRoom = document.querySelector('#dd-room');
+        if (elRoom) elRoom.textContent = roomId;
+        const taR = document.querySelector('#dd-kw-room');
+        if (taR) taR.value = roomKeywords.join('\n');
+        updateBadgeCbs.forEach(cb => cb());
+      }
       const active = isLiveContext();
       const panel = document.getElementById('dd-panel');
       if (!active) {
